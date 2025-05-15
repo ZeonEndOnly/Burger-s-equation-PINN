@@ -1,0 +1,100 @@
+import tensorflow as tf
+import numpy as np
+import deepxde as dde
+import matplotlib.pyplot as plt
+
+# Parameters for Burger's equation
+L = 1.0  # Length of spatial domain (-L to L)
+nu = 0.01 / np.pi  # Kinematic viscosity
+n = 1  # Frequency for initial condition
+
+# Domain setup
+geom = dde.geometry.Interval(-L, L)
+timedomain = dde.geometry.TimeDomain(0, 1)
+geomtime = dde.geometry.GeometryXTime(geom, timedomain)
+
+# Initial and boundary conditions
+def ic_func(x):
+    return -np.sin(n * np.pi * x[:, 0:1])
+
+def bc_func(x):
+    return -np.sin(n * np.pi * x[:, 0:1])
+
+ic = dde.icbc.IC(geomtime, ic_func, lambda _, on_initial: on_initial)
+bc_left = dde.icbc.DirichletBC(geomtime, bc_func, lambda x, _: np.isclose(x[0], -L))
+bc_right = dde.icbc.DirichletBC(geomtime, bc_func, lambda x, _: np.isclose(x[0], L))
+
+# Burger's equation (forward problem)
+def burgers_eqn(x, u):
+    du_dt = dde.grad.jacobian(u, x, i=0, j=1)
+    du_dx = dde.grad.jacobian(u, x, i=0, j=0)
+    d2u_dx2 = dde.grad.hessian(u, x, i=0, j=0)
+    return du_dt + u * du_dx - nu * d2u_dx2
+
+# Data configuration
+data = dde.data.TimePDE(
+    geomtime,
+    burgers_eqn,
+    [ic, bc_left, bc_right],
+    num_domain=2540,
+    num_boundary=80,
+    num_initial=160,
+    num_test=10000
+)
+
+# Neural network architecture (7 layers × 50 neurons)
+net = dde.nn.FNN([2] + [50]*7 + [1], "tanh", "Glorot normal")
+
+# Build and train model
+model = dde.Model(data, net)
+model.compile("adam", lr=1e-3)
+model.train(iterations=40000)  # Adam optimizer
+model.compile("L-BFGS-B")
+model.train()  # L-BFGS refinement
+
+# Save forward solution data with proper formatting and exact time steps
+def save_forward_solution(model):
+    # Create grid points matching paper's domain
+    x = np.linspace(-L, L, 100)  # Spatial points
+    t_values = [0.00, 0.25, 0.50, 0.75, 1.00]  # Exact time steps for inverse problem
+    
+    all_data = []
+    
+    for t in t_values:
+        X_t = np.column_stack([x, np.full_like(x, t)])  # Combine spatial and temporal points
+        u_pred = model.predict(X_t)                    # Predict solution values at (x,t)
+        all_data.append(np.column_stack([X_t[:, 0], X_t[:, 1], u_pred]))  # Combine x,t,u
+    
+    all_data = np.vstack(all_data)                     # Stack all time steps together
+    
+    # Save to file in format: x t u(x,t)
+    np.savetxt("forward_solution.dat", all_data,
+               header="x t u", comments='', fmt="%.6f")
+    
+save_forward_solution(model)
+
+# Plot forward solutions at specific time steps (unchanged functionality)
+def plot_forward_solutions(model):
+    time_steps = [0.00, 0.25, 0.50, 0.75, 1.00]  # Exact time steps for visualization
+    x = np.linspace(-L, L, 100)[:, None]
+    
+    plt.figure(figsize=(15, 8))
+    
+    for i, t in enumerate(time_steps):
+        plt.subplot(2, 3 if len(time_steps) > 4 else len(time_steps), i + 1) 
+        xt = np.hstack((x, np.full_like(x, t)))
+        u_pred = model.predict(xt)
+        
+        plt.plot(x[:, 0], u_pred[:, 0], 'b-', linewidth=2)
+        plt.title(f'Solution at t={t:.2f}', fontsize=12)
+        plt.xlabel('x', fontsize=10)
+        plt.ylabel('u(x,t)', fontsize=10)
+        plt.grid(True)
+        plt.ylim(-1.1, 1.1)
+    
+    plt.suptitle("Forward Problem Solutions of Burger's Equation", fontsize=14)
+    plt.tight_layout()
+    plt.savefig("forward_solution_subplots.png")
+    plt.show()
+
+plot_forward_solutions(model)

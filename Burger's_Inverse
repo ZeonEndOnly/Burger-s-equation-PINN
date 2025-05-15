@@ -1,0 +1,100 @@
+import tensorflow as tf
+import numpy as np 
+import deepxde as dde
+import matplotlib.pyplot as plt
+
+# Enable TensorFlow compatibility mode for DeepXDE
+tf.compat.v1.enable_eager_execution()
+
+# Load forward solution data (training data from forward problem)
+data = np.loadtxt("forward_solution.dat", skiprows=1)  # Skip header
+X_train, u_train = data[:, :2], data[:, 2:]  # Split into inputs (x, t) and outputs (u)
+
+# Set DeepXDE backend to TensorFlow
+dde.backend.set_default_backend("tensorflow")
+
+# Parameters from paper
+L = 1.0  # Spatial domain length (-L to L)
+nu = 0.01 / np.pi  # Kinematic viscosity (target λ₂)
+n = 1  # Frequency for initial condition
+
+# Initialize trainable parameters (λ₁ and λ₂)
+lambda1 = tf.Variable(1.0, dtype=tf.float32, name="lambda1")  # Target: λ₁ = 1.0
+lambda2 = tf.Variable(nu, dtype=tf.float32, name="lambda2")   # Target: λ₂ = nu
+
+# Define domain geometry and time domain
+geom = dde.geometry.Interval(-L, L)  # Spatial domain [-L, L]
+timedomain = dde.geometry.TimeDomain(0, 1)  # Time domain [0, 1]
+geomtime = dde.geometry.GeometryXTime(geom, timedomain)
+
+# Define modified PDE for inverse problem (Burger's equation with λ₁ and λ₂)
+def burgers_inverse(x, u):
+    du_dt = dde.grad.jacobian(u, x, i=0, j=1)       # Time derivative ∂u/∂t
+    du_dx = dde.grad.jacobian(u, x, i=0, j=0)       # Spatial derivative ∂u/∂x
+    d2u_dx2 = dde.grad.hessian(u, x, i=0, j=0)      # Second spatial derivative ∂²u/∂x²
+    return du_dt + lambda1 * (u * du_dx) - lambda2 * d2u_dx2
+
+# Define observation boundary condition using training data
+observe_u = dde.icbc.PointSetBC(X_train, u_train)
+
+# Configure data for inverse problem (as per paper specifications)
+data = dde.data.TimePDE(
+    geomtime,
+    burgers_inverse,
+    [observe_u],              # Observation boundary condition
+    num_domain=2540,          # Number of domain points
+    num_boundary=80,          # Number of boundary points
+    num_initial=160           # Number of initial condition points
+)
+
+# Neural network architecture (7 layers × 50 neurons per layer)
+net = dde.nn.FNN([2] + [50]*7 + [1], "tanh", "Glorot normal")  # Activation: tanh
+
+# Build model with Adam optimizer and loss weighting for observation points
+model = dde.Model(data, net)
+model.compile("adam", lr=1e-3, loss_weights=[100])  # Prioritize observation points
+
+# Training phase: Adam optimizer with paper's iteration count (40k iterations)
+print("Initial parameters:", lambda1.numpy(), lambda2.numpy())
+losshistory_adam, train_state_adam = model.train(iterations=40000)
+
+# Refinement phase: L-BFGS optimizer for higher accuracy
+model.compile("L-BFGS-B")
+losshistory_lbfgs, train_state_lbfgs = model.train()
+
+# Print final learned parameters with comparison to target values
+print("\nFinal learned parameters:")
+print(f"λ₁ = {lambda1.numpy():.6f} (Target: 1.000000)")
+print(f"λ₂ = {lambda2.numpy():.6f} (Target: {nu:.6f})")
+
+# Visualization function for comparison between forward and inverse solutions
+def plot_comparison():
+    x = np.linspace(-L, L, 100)  # Spatial domain points [-L, L]
+    t_values = [0.0, 0.25, 0.5, 0.75, 1.0]  # Time steps for visualization
+    
+    plt.figure(figsize=(15, 4))
+    
+    for i, t in enumerate(t_values):
+        # Extract forward solution at current time step from training data
+        mask = np.isclose(X_train[:, 1], t)
+        x_forward = X_train[mask][:, 0]
+        u_forward = u_train[mask]
+        
+        # Predict PINN solution at current time step
+        xt = np.hstack((x[:, None], np.full_like(x[:, None], t)))
+        u_pred = model.predict(xt)
+        
+        plt.subplot(1, len(t_values), i + 1)
+        plt.plot(x_forward, u_forward, 'b-', lw=2, label='Forward')   # Forward solution (blue solid line)
+        plt.plot(x, u_pred, 'g--', lw=2, label='PINN')                # PINN prediction (green dashed line)
+        plt.title(f"t = {t:.2f}")
+        plt.grid(True)
+        plt.ylim(-1.1, 1.1)
+        if i == 0:
+            plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig("comparison.png")
+    plt.show()
+
+plot_comparison()
